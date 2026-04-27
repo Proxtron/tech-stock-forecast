@@ -28,16 +28,21 @@ cd tech-stock-forecast
 pip install -r requirements.txt
 ```
 
+## Run Web Dashboard
+
+```bash
+streamlit run app.py
+```
+
 ## Requirements
 
 ```
 pandas
 numpy
 scikit-learn
-yfinance
+imblearn
 matplotlib
 seaborn
-jupytext
-nbstripout
-dvc
+streamlit
+plotly
 ```
