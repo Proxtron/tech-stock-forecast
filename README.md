@@ -34,6 +34,12 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Run Test Units
+
+```bash
+pytest -q
+```
+
 ## Requirements
 
 ```
