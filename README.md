@@ -45,4 +45,6 @@ matplotlib
 seaborn
 streamlit
 plotly
+xgboost
+pytest
 ```

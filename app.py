@@ -17,185 +17,17 @@ from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
     r2_score,
-    classification_report
+    classification_report,
 )
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.preprocessing import OrdinalEncoder, StandardScaler
-from xgboost import XGBClassifier, XGBRegressor
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-
-FEATURE_COLS = [
-    "Volume",
-    "Ticker",
-    "MA_7",
-    "Daily_Return",
-    "Momentum_7d",
-    "Volatility_7d",
-    "RSI_14",
-    "MACD",
-    "Volume_Change",
-]
-
-ALL_NOTEBOOK_FEATURES = [
-    "Open",
-    "High",
-    "Low",
-    "Volume",
-    "Ticker",
-    "MA_7",
-    "MA_30",
-    "Daily_Return",
-    "Momentum_7d",
-    "Volatility_7d",
-    "RSI_14",
-    "MACD",
-    "Volume_Change",
-    "Lag_1",
-    "Lag_2",
-    "Lag_3",
-]
-
-@st.cache_data
-def load_and_prepare_data():
-    df = pd.read_csv(
-        "./datasets/major-tech-stock-2019-2024.csv",
-        header=0, index_col=0,
-    )
-    df.index = pd.to_datetime(df.index)
-
-    enc = OrdinalEncoder()
-    df["Ticker"] = enc.fit_transform(df[["Ticker"]])
-    ticker_map = {i: name for i, name in enumerate(enc.categories_[0])}
-
-    g = df.groupby("Ticker")["Adj Close"]
-    df["MA_7"] = g.transform(lambda x: x.shift(1).rolling(7).mean())
-    df["MA_30"] = g.transform(lambda x: x.shift(1).rolling(30).mean())
-    df["Daily_Return"] = (df["Close"] - df["Open"]) / df["Open"]
-    df["Momentum_7d"] = g.transform(lambda x: x.shift(1).pct_change(7) * 100)
-    df["Volatility_7d"] = g.transform(
-        lambda x: x.shift(1).pct_change().rolling(7).std() * (252 ** 0.5)
-    )
-
-    def rsi(series, period=14):
-        delta = series.diff()
-        gain = delta.clip(lower=0).rolling(period).mean()
-        loss = -delta.clip(upper=0).rolling(period).mean()
-        return 100 - (100 / (1 + gain / loss))
-
-    df["RSI_14"] = g.transform(lambda x: rsi(x.shift(1)))
-
-    ema_10 = g.transform(lambda x: x.shift(1).ewm(span=10).mean())
-    ema_25 = g.transform(lambda x: x.shift(1).ewm(span=25).mean())
-    df["MACD"] = ema_10 - ema_25
-
-    df["Volume_Change"] = df.groupby("Ticker")["Volume"].transform(lambda x: x.pct_change())
-
-    for lag in [1, 2, 3]:
-        df[f"Lag_{lag}"] = g.transform(lambda x, lag=lag: x.shift(lag))
-
-    df["Target"] = g.transform(lambda x: x.shift(-1))
-    df["Direction"] = (df["Target"] > df["Adj Close"]).astype(int)
-
-    useful_feats_X = df[FEATURE_COLS].copy()
-    trgt_y = df[["Target", "Direction"]].copy()
-
-    data = pd.concat([useful_feats_X, trgt_y, df[["Adj Close"]]], axis=1)
-    data = data.dropna().copy()
-
-    df = df.loc[data.index].copy()
-
-    return df, data, ticker_map
-
-
-@st.cache_resource
-def train_models(df):
-    train_list, test_list = [], []
-    for ticker in df["Ticker"].unique():
-        td = df[df["Ticker"] == ticker].sort_index()
-        split_idx = int(len(td) * 0.8)
-        train_list.append(td.iloc[:split_idx])
-        test_list.append(td.iloc[split_idx:])
-
-    train_df = pd.concat(train_list)
-    test_df = pd.concat(test_list).copy()
-
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(train_df[FEATURE_COLS])
-    X_test = scaler.transform(test_df[FEATURE_COLS])
-
-    y_train_clf = train_df["Direction"]
-    y_train_reg = train_df["Target"]
-
-    clf = XGBClassifier(
-        subsample=0.8,
-        n_estimators=300,
-        learning_rate=0.01,
-        max_depth=4,
-        random_state=42,
-        eval_metric="logloss",
-    )
-    clf.fit(X_train, y_train_clf)
-    test_df["Pred_Direction"] = clf.predict(X_test)
-
-    reg = XGBRegressor(
-        subsample=0.8,
-        n_estimators=300,
-        max_depth=4,
-        learning_rate=0.01,
-        random_state=42,
-    )
-    reg.fit(X_train, y_train_reg)
-    test_df["Pred_Price"] = reg.predict(X_test)
-
-    # walk-forward validation summaries
-    X_all = df[FEATURE_COLS].values
-    y_all_clf = df["Direction"].values
-    y_all_reg = df["Target"].values
-
-    tscv = TimeSeriesSplit(n_splits=5)
-    clf_wf_rows = []
-    reg_wf_rows = []
-
-    for fold, (train_idx, test_idx) in enumerate(tscv.split(X_all), start=1):
-        fold_scaler = StandardScaler()
-        X_tr = fold_scaler.fit_transform(X_all[train_idx])
-        X_te = fold_scaler.transform(X_all[test_idx])
-
-        clf_wf = XGBClassifier(
-            subsample=0.8,
-            n_estimators=300,
-            learning_rate=0.01,
-            max_depth=4,
-            random_state=42,
-            eval_metric="logloss",
-        )
-        clf_wf.fit(X_tr, y_all_clf[train_idx])
-        clf_wf_rows.append({
-            "Fold": fold,
-            "Accuracy": accuracy_score(y_all_clf[test_idx], clf_wf.predict(X_te)),
-        })
-
-        reg_wf = XGBRegressor(
-            subsample=0.8,
-            n_estimators=300,
-            max_depth=4,
-            learning_rate=0.01,
-            random_state=42,
-        )
-        reg_wf.fit(X_tr, y_all_reg[train_idx])
-        y_pred_fold = reg_wf.predict(X_te)
-
-        reg_wf_rows.append({
-            "Fold": fold,
-            "MAE": mean_absolute_error(y_all_reg[test_idx], y_pred_fold),
-            "RMSE": np.sqrt(mean_squared_error(y_all_reg[test_idx], y_pred_fold)),
-            "R²": r2_score(y_all_reg[test_idx], y_pred_fold),
-        })
-
-    return train_df, test_df, clf, reg, pd.DataFrame(clf_wf_rows), pd.DataFrame(reg_wf_rows)
-
+from pipeline import (
+    ALL_NOTEBOOK_FEATURES,
+    FEATURE_COLS,
+    load_and_prepare_data,
+    train_models,
+)
 
 # --- UI ---
 
@@ -260,15 +92,14 @@ with col1:
     rmse = np.sqrt(mean_squared_error(test_df["Target"], test_df["Pred_Price"]))
     r2 = r2_score(test_df["Target"], test_df["Pred_Price"])
 
-    # Persistence baseline: predict today's Adj Close for tomorrow.
     p_mae = mean_absolute_error(test_df["Target"], test_df["Adj Close"])
     p_rmse = np.sqrt(mean_squared_error(test_df["Target"], test_df["Adj Close"]))
     p_r2 = r2_score(test_df["Target"], test_df["Adj Close"])
 
-    metrics_df = pd.DataFrame({
+    metrics_df = {
         "Model (XGB)": [f"${mae:.2f}", f"${rmse:.2f}", f"{r2:.4f}"],
         "Persistence baseline": [f"${p_mae:.2f}", f"${p_rmse:.2f}", f"{p_r2:.4f}"],
-    }, index=["MAE", "RMSE", "R²"])
+    }
     st.dataframe(metrics_df, use_container_width=True)
     st.caption(
         "Persistence = predict today's price for tomorrow. If the model "
@@ -280,18 +111,20 @@ with col2:
     acc = accuracy_score(test_df["Direction"], test_df["Pred_Direction"])
     majority = test_df["Direction"].value_counts(normalize=True).max()
 
-    clf_df = pd.DataFrame({
+    clf_df = {
         "Score": [f"{acc:.4f}", f"{majority:.4f}"],
-    }, index=["Model accuracy", "Majority-class baseline"])
-    st.dataframe(clf_df, use_container_width=True)
+    }
+    st.dataframe(
+        clf_df,
+        use_container_width=True,
+    )
 
     cm = confusion_matrix(test_df["Direction"], test_df["Pred_Direction"])
-    cm_df = pd.DataFrame(
-        cm, index=["Actual Down", "Actual Up"],
-        columns=["Pred Down", "Pred Up"],
-    )
     st.write("**Confusion matrix**")
-    st.dataframe(cm_df, use_container_width=True)
+    st.dataframe(
+        cm,
+        use_container_width=True,
+    )
 
 # --- Per-ticker breakdown ---
 st.header("Per-ticker breakdown")
@@ -308,6 +141,7 @@ for tid, name in ticker_map.items():
         "Accuracy": accuracy_score(sub["Direction"], sub["Pred_Direction"]),
         "Majority baseline": sub["Direction"].value_counts(normalize=True).max(),
     })
+
 breakdown = pd.DataFrame(rows).set_index("Ticker").round(4)
 st.dataframe(breakdown, use_container_width=True)
 
@@ -389,7 +223,7 @@ plt.close(fig_corr2)
 
 # histograms
 st.subheader("Feature Distributions")
-df_hist = model_data[FEATURE_COLS].hist(bins=40, figsize=(14, 12))
+model_data[FEATURE_COLS].hist(bins=40, figsize=(14, 12))
 plt.tight_layout()
 st.pyplot(plt.gcf())
 plt.close(plt.gcf())
