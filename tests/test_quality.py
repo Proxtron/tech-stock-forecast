@@ -1,158 +1,180 @@
-"""
-Quality control: unit/component, integration, and acceptance tests.
+import sys
+from pathlib import Path
 
-Unit/component: pipeline helpers and invariants in isolation.
-Integration: load + train + metrics wiring without the Streamlit UI.
-Acceptance: application-level criteria (import safety, end-to-end AI outputs).
-"""
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from __future__ import annotations
-
-import importlib
+import math
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pytest
-from sklearn.metrics import (
-    accuracy_score,
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
+
+from pipeline import (
+    DEFAULT_DATA_PATH,
+    FEATURE_COLS,
+    ALL_NOTEBOOK_FEATURES,
+    load_and_prepare_data,
+    train_models,
 )
 
-import pipeline
-from pipeline import FEATURE_COLS, load_and_prepare_data, train_models
+
+def test_default_data_path_exists():
+    assert Path(DEFAULT_DATA_PATH).exists(), f"Missing dataset: {DEFAULT_DATA_PATH}"
 
 
-# --- Unit / component tests ---
+def test_load_and_prepare_data_returns_expected_types():
+    df, data, ticker_map = load_and_prepare_data()
+
+    assert isinstance(df, pd.DataFrame)
+    assert isinstance(data, pd.DataFrame)
+    assert isinstance(ticker_map, dict)
+    assert len(df) > 0
+    assert len(data) > 0
+    assert len(ticker_map) == 5
 
 
-class TestUnitPipelineLoad:
-    """Component tests for `load_and_prepare_data` (no model training)."""
+def test_required_columns_exist():
+    df, data, _ = load_and_prepare_data()
 
-    def test_load_returns_dataframe_and_ticker_map(self):
-        df, ticker_map = load_and_prepare_data()
-        assert isinstance(df, pd.DataFrame)
-        assert isinstance(ticker_map, dict)
-        assert len(ticker_map) >= 1
+    required_df_cols = set(ALL_NOTEBOOK_FEATURES + ["Adj Close", "Target", "Direction"])
+    required_data_cols = set(FEATURE_COLS + ["Adj Close", "Target", "Direction"])
 
-    def test_required_feature_and_target_columns_present(self):
-        df, _ = load_and_prepare_data()
-        for col in FEATURE_COLS:
-            assert col in df.columns
-        assert "Target" in df.columns
-        assert "Direction" in df.columns
-        assert "Adj Close" in df.columns
-
-    def test_no_nan_in_model_inputs_after_prepare(self):
-        df, _ = load_and_prepare_data()
-        assert not df[FEATURE_COLS].isna().any().any()
-
-    def test_direction_is_binary(self):
-        df, _ = load_and_prepare_data()
-        assert set(df["Direction"].unique()).issubset({0, 1})
-
-    def test_rolling_features_respect_per_ticker_groups(self):
-        """Sanity: each ticker has contiguous blocks in the raw file; index is datetime."""
-        df, ticker_map = load_and_prepare_data()
-        assert isinstance(df.index, pd.DatetimeIndex)
-        for name in ticker_map.values():
-            tid = next(k for k, v in ticker_map.items() if v == name)
-            sub = df[df["Ticker"] == tid].sort_index()
-            assert len(sub) > 50
+    assert required_df_cols.issubset(df.columns), required_df_cols - set(df.columns)
+    assert required_data_cols.issubset(data.columns), required_data_cols - set(data.columns)
 
 
-class TestUnitPipelineTrain:
-    """Component tests for `train_models` on a fixed small frame."""
-
-    @pytest.fixture
-    def tiny_df(self):
-        """Minimal synthetic data matching FEATURE_COLS + training targets."""
-        rng = np.random.default_rng(0)
-        n = 120
-        idx = pd.date_range("2020-01-02", periods=n, freq="B")
-        rows = []
-        for tid in (0, 1):
-            base = 100.0 + np.cumsum(rng.normal(0, 0.5, n))
-            adj = base + rng.normal(0, 0.1, n)
-            target = np.roll(adj, -1)
-            target[-1] = adj[-1]
-            direction = (target > adj).astype(int)
-            for i in range(n):
-                rows.append({
-                    "MA_7": adj[i],
-                    "Volume": int(rng.integers(1e6, 2e6)),
-                    "Ticker": float(tid),
-                    "RSI_14": float(rng.uniform(20, 80)),
-                    "Momentum_7d": float(rng.normal(0, 1)),
-                    "Volatility_7d": float(rng.uniform(0.1, 2.0)),
-                    "Daily_Return": float(rng.normal(0, 0.01)),
-                    "Adj Close": adj[i],
-                    "Target": target[i],
-                    "Direction": direction[i],
-                })
-        df = pd.DataFrame(rows, index=np.tile(idx, 2))
-        df.index = pd.to_datetime(df.index)
-        df.sort_index(inplace=True)
-        return df
-
-    def test_train_produces_predictions_and_expected_shapes(self, tiny_df):
-        train_df, test_df, clf, reg = train_models(tiny_df)
-        assert len(train_df) > len(test_df)
-        assert "Pred_Direction" in test_df.columns
-        assert "Pred_Price" in test_df.columns
-        assert len(test_df["Pred_Price"]) == len(test_df)
-        assert clf.n_features_in_ == len(FEATURE_COLS)
-        assert reg.n_features_in_ == len(FEATURE_COLS)
+def test_modeling_data_has_no_missing_values():
+    _, data, _ = load_and_prepare_data()
+    assert data[FEATURE_COLS + ["Target", "Direction", "Adj Close"]].isnull().sum().sum() == 0
 
 
-# --- Integration tests ---
+def test_ticker_is_numeric_and_direction_is_binary():
+    _, data, _ = load_and_prepare_data()
+
+    assert pd.api.types.is_numeric_dtype(data["Ticker"])
+    assert set(data["Direction"].unique()).issubset({0, 1})
 
 
-class TestIntegrationLoadAndTrain:
-    """Integration: CSV → features → both models → scored test set."""
+def test_filtered_df_matches_modeling_rows():
+    df, data, _ = load_and_prepare_data()
 
-    def test_full_pipeline_on_bundled_dataset(self):
-        df, ticker_map = load_and_prepare_data()
-        train_df, test_df, clf, reg = train_models(df)
-
-        assert len(train_df) + len(test_df) == len(df)
-        mae = mean_absolute_error(test_df["Target"], test_df["Pred_Price"])
-        rmse = float(np.sqrt(mean_squared_error(test_df["Target"], test_df["Pred_Price"])))
-        r2 = r2_score(test_df["Target"], test_df["Pred_Price"])
-        acc = accuracy_score(test_df["Direction"], test_df["Pred_Direction"])
-
-        assert np.isfinite(mae) and mae >= 0
-        assert np.isfinite(rmse) and rmse >= 0
-        assert np.isfinite(r2)
-        assert 0 <= acc <= 1
-        assert set(ticker_map.values()) == {"AAPL", "AMZN", "GOOGL", "MSFT", "TSLA"}
-
-        for tid in df["Ticker"].unique():
-            tr_n = len(train_df[train_df["Ticker"] == tid])
-            te_n = len(test_df[test_df["Ticker"] == tid])
-            assert tr_n > 0 and te_n > 0
-            assert tr_n >= te_n * 3
+    assert len(df) == len(data)
+    assert df.index.equals(data.index)
 
 
-# --- Acceptance tests ---
+def test_chronological_split_per_ticker():
+    _, data, _ = load_and_prepare_data()
+    train_df, test_df, _, _, _, _ = train_models(data)
+
+    for ticker in data["Ticker"].unique():
+        sub_train = train_df[train_df["Ticker"] == ticker]
+        sub_test = test_df[test_df["Ticker"] == ticker]
+
+        assert len(sub_train) > 0
+        assert len(sub_test) > 0
+        assert sub_train.index.max() < sub_test.index.min()
 
 
-class TestAcceptanceApplication:
-    """System-level checks: app importable without UI, QC criteria on real run."""
+def test_prediction_lengths_and_columns():
+    _, data, _ = load_and_prepare_data()
+    train_df, test_df, clf, reg, clf_wf_df, reg_wf_df = train_models(data)
 
-    def test_app_module_import_does_not_run_streamlit_dashboard(self):
-        """Importing `app` must not invoke `run_dashboard()` (guarded by __main__)."""
-        mod = importlib.import_module("app")
-        assert hasattr(mod, "run_dashboard")
-        assert callable(mod.run_dashboard)
+    assert len(train_df) + len(test_df) == len(data)
+    assert "Pred_Direction" in test_df.columns
+    assert "Pred_Price" in test_df.columns
+    assert len(test_df["Pred_Direction"]) == len(test_df)
+    assert len(test_df["Pred_Price"]) == len(test_df)
 
-    def test_pipeline_default_path_points_to_existing_csv(self):
-        assert pipeline.DEFAULT_DATA_PATH.is_file()
+    assert clf is not None
+    assert reg is not None
+    assert len(clf_wf_df) == 5
+    assert len(reg_wf_df) == 5
 
-    def test_acceptance_trained_models_meet_basic_sanity(self):
-        """End-to-end: bundled data yields finite predictions for all test rows."""
-        df, _ = load_and_prepare_data()
-        _, test_df, _, _ = train_models(df)
-        assert (np.isfinite(test_df["Pred_Price"])).all()
-        assert set(test_df["Pred_Direction"].unique()).issubset({0, 1})
+
+def test_prediction_values_are_valid():
+    _, data, _ = load_and_prepare_data()
+    _, test_df, _, _, _, _ = train_models(data)
+
+    assert set(pd.Series(test_df["Pred_Direction"]).unique()).issubset({0, 1})
+    assert np.isfinite(test_df["Pred_Price"]).all()
+
+
+def test_metrics_are_finite():
+    _, data, _ = load_and_prepare_data()
+    _, test_df, _, _, clf_wf_df, reg_wf_df = train_models(data)
+
+    mae = float(np.mean(np.abs(test_df["Target"] - test_df["Pred_Price"])))
+    rmse = float(np.sqrt(np.mean((test_df["Target"] - test_df["Pred_Price"]) ** 2)))
+    acc = float((test_df["Direction"] == test_df["Pred_Direction"]).mean())
+
+    assert math.isfinite(mae)
+    assert math.isfinite(rmse)
+    assert math.isfinite(acc)
+    assert 0.0 <= acc <= 1.0
+
+    assert np.isfinite(clf_wf_df["Accuracy"]).all()
+    assert np.isfinite(reg_wf_df["MAE"]).all()
+    assert np.isfinite(reg_wf_df["RMSE"]).all()
+    assert np.isfinite(reg_wf_df["R²"]).all()
+
+
+def test_expected_tickers_present():
+    _, data, ticker_map = load_and_prepare_data()
+    ticker_names = set(ticker_map.values())
+
+    assert ticker_names == {"AAPL", "AMZN", "GOOGL", "MSFT", "TSLA"}
+    assert data["Ticker"].nunique() == 5
+
+
+def test_leakage_safe_ma7_matches_manual_calculation():
+    df, _, _ = load_and_prepare_data()
+
+    ticker_value = df["Ticker"].iloc[0]
+    sub = df[df["Ticker"] == ticker_value].sort_index()
+
+    idx = sub.index[40]
+    manual = sub["Adj Close"].shift(1).rolling(window=7).mean().loc[idx]
+    stored = sub.loc[idx, "MA_7"]
+
+    assert np.isclose(manual, stored, equal_nan=True)
+
+
+def test_leakage_safe_momentum_matches_manual_calculation():
+    df, _, _ = load_and_prepare_data()
+
+    ticker_value = df["Ticker"].iloc[0]
+    sub = df[df["Ticker"] == ticker_value].sort_index()
+
+    idx = sub.index[40]
+    manual = sub["Adj Close"].shift(1).pct_change(periods=7).loc[idx] * 100
+    stored = sub.loc[idx, "Momentum_7d"]
+
+    assert np.isclose(manual, stored, equal_nan=True)
+
+def test_leakage_safe_ma7_matches_manual_calculation():
+    df, _, _ = load_and_prepare_data()
+
+    ticker_value = df["Ticker"].iloc[0]
+    sub = df[df["Ticker"] == ticker_value].sort_index().copy().reset_index(drop=True)
+
+    pos = 40
+    manual = sub["Adj Close"].shift(1).rolling(window=7).mean().iloc[pos]
+    stored = sub["MA_7"].iloc[pos]
+
+    assert np.isclose(manual, stored, equal_nan=True)
+
+
+def test_leakage_safe_momentum_matches_manual_calculation():
+    df, _, _ = load_and_prepare_data()
+
+    ticker_value = df["Ticker"].iloc[0]
+    sub = df[df["Ticker"] == ticker_value].sort_index().copy().reset_index(drop=True)
+
+    pos = 40
+    manual = sub["Adj Close"].shift(1).pct_change(periods=7).iloc[pos] * 100
+    stored = sub["Momentum_7d"].iloc[pos]
+
+    assert np.isclose(manual, stored, equal_nan=True)
+
+def test_importing_app_is_safe():
+    import app  # noqa: F401
